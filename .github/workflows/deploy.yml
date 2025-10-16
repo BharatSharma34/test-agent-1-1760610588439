@@ -1,0 +1,84 @@
+name: Deploy Lambda agent
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install deployment tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install boto3 wheel
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: eu-north-1
+
+      - name: Prepare Lambda Function
+        run: |
+          set -e
+          FUNC_NAME=$(echo "${{ github.repository }}" | cut -d'/' -f2 | sed 's/[^a-zA-Z0-9_-]/_/g')
+          mkdir -p build
+          cat agent.py > build/lambda_function.py
+
+          echo "" >> build/lambda_function.py
+          echo "# Auto-generated Lambda handler" >> build/lambda_function.py
+          echo "import json, inspect" >> build/lambda_function.py
+          echo "def lambda_handler(event, context):" >> build/lambda_function.py
+          echo "    try:" >> build/lambda_function.py
+          echo "        body = event.get('body', {})" >> build/lambda_function.py
+          echo "        if isinstance(body, str): body = json.loads(body)" >> build/lambda_function.py
+          echo "        funcs = [v for k, v in globals().items() if callable(v) and k != 'lambda_handler']" >> build/lambda_function.py
+          echo "        if not funcs: return {'statusCode': 500, 'body': json.dumps({'error': 'No callable function found'})}" >> build/lambda_function.py
+          echo "        func = funcs[-1]" >> build/lambda_function.py
+          echo "        sig = inspect.signature(func)" >> build/lambda_function.py
+          echo "        args = {k: body[k] for k in sig.parameters if k in body}" >> build/lambda_function.py
+          echo "        result = func(**args)" >> build/lambda_function.py
+          echo "        return {'statusCode': 200, 'body': json.dumps(result)}" >> build/lambda_function.py
+          echo "    except Exception as e:" >> build/lambda_function.py
+          echo "        import traceback" >> build/lambda_function.py
+          echo "        return {'statusCode': 500, 'body': json.dumps({'error': str(e), 'traceback': traceback.format_exc()})}"
+
+          if [[ -s requirements.txt ]]; then
+            pip install -r requirements.txt -t build/
+          fi
+
+      - name: Deploy to Lambda
+        run: |
+          set -e
+          FUNC_NAME=$(echo "${{ github.repository }}" | cut -d'/' -f2 | sed 's/[^a-zA-Z0-9_-]/_/g')
+          AGENT_SECRET=${{ secrets.AGENT_SECRET }}
+
+          cd build
+          zip -r "../${FUNC_NAME}.zip" . > /dev/null
+          cd ..
+
+          if aws lambda get-function --function-name "$FUNC_NAME" > /dev/null 2>&1; then
+            aws lambda update-function-code --function-name "$FUNC_NAME" --zip-file fileb://"${FUNC_NAME}.zip"
+            sleep 5
+            aws lambda update-function-configuration               --function-name "$FUNC_NAME"               --environment "Variables={ENV=prod,AGENT_SECRET=$AGENT_SECRET,LAMBDA_NAME=$FUNC_NAME}"               --timeout 60               --memory-size 256
+            echo "✅ Updated $FUNC_NAME"
+          else
+            aws lambda create-function               --function-name "$FUNC_NAME"               --runtime python3.11               --role arn:aws:iam::851725561714:role/Python_lambda               --handler lambda_function.lambda_handler               --zip-file fileb://"${FUNC_NAME}.zip"               --timeout 60               --memory-size 256               --environment "Variables={ENV=prod,AGENT_SECRET=$AGENT_SECRET,LAMBDA_NAME=$FUNC_NAME}"
+            echo "✅ Created $FUNC_NAME"
+          fi
